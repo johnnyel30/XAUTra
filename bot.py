@@ -74,17 +74,20 @@ log = logging.getLogger("EMABot")
 # ══════════════════════════════════════════════════════════════════════
 
 def tg(msg: str):
-    """Envía notificación a Telegram. Falla silenciosamente si no está configurado."""
+    """Envía notificación a Telegram."""
     if not TG_TOKEN or not TG_CHAT:
+        log.warning("Telegram no configurado: TG_TOKEN o TG_CHAT vacíos.")
         return
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
-            timeout=5,
+            timeout=10,
         )
+        if not r.ok:
+            log.warning(f"Telegram error {r.status_code}: {r.text}")
     except Exception as e:
-        log.warning(f"Telegram: {e}")
+        log.warning(f"Telegram excepción: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -394,6 +397,8 @@ class EMABot:
         log.info("═" * 65)
         log.info(f"  XAUUSDT EMA{EMA_FAST}/{EMA_SLOW} CROSSOVER BOT  ·  INICIANDO")
         log.info("═" * 65)
+        log.info(f"Telegram TOKEN configurado: {'SI' if TG_TOKEN else 'NO'}")
+        log.info(f"Telegram CHAT_ID configurado: {'SI' if TG_CHAT else 'NO'}")
 
         await self.load_contract()
 
