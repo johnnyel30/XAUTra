@@ -138,17 +138,35 @@ class EMABot:
 
     # ── Capa de red con exponential backoff ───────────────────────────
 
-    async def _call(self, coro, retries: int = MAX_RETRIES):
+    async def _call(self, fn, retries: int = MAX_RETRIES):
+        """
+        Llama a fn() con reintentos y backoff exponencial.
+        fn debe ser un callable (lambda) que retorne una coroutine,
+        así se crea una coroutine fresca en cada reintento.
+        """
         for attempt in range(retries):
             try:
-                return await coro
-            except ccxt.RateLimitExceeded:
-                wait = RETRY_BASE * (2 ** attempt)
-                log.warning(f"Rate limit — esperando {wait:.0f}s")
+                return await fn()
+            except ccxt.RateLimitExceeded as e:
+                msg = str(e)
+                # Ban de IP de Binance — esperar hasta que se levante
+                if "banned" in msg.lower() or "418" in msg:
+                    wait = 60
+                    log.warning(f"IP baneada por Binance — esperando {wait}s antes de reintentar")
+                    tg(f"⚠️ IP baneada por Binance. Esperando {wait}s...")
+                else:
+                    wait = RETRY_BASE * (2 ** attempt)
+                    log.warning(f"Rate limit — esperando {wait:.0f}s")
                 await asyncio.sleep(wait)
             except ccxt.NetworkError as e:
-                wait = RETRY_BASE * (2 ** attempt)
-                log.warning(f"Red: {e} — reintento {attempt+1}/{retries} en {wait:.0f}s")
+                msg = str(e)
+                if "banned" in msg.lower() or "418" in msg:
+                    wait = 60
+                    log.warning(f"IP baneada por Binance — esperando {wait}s")
+                    tg(f"⚠️ IP baneada por Binance. Esperando {wait}s...")
+                else:
+                    wait = RETRY_BASE * (2 ** attempt)
+                    log.warning(f"Red: {e} — reintento {attempt+1}/{retries} en {wait:.0f}s")
                 await asyncio.sleep(wait)
             except ccxt.ExchangeError as e:
                 log.error(f"Exchange: {e}")
@@ -158,7 +176,7 @@ class EMABot:
     # ── Utilidades del contrato ───────────────────────────────────────
 
     async def load_contract(self):
-        markets = await self._call(self.exchange.load_markets())
+        markets = await self._call(lambda: self.exchange.load_markets())
         if CCXT_SYMBOL not in markets:
             raise ValueError(f"Símbolo {CCXT_SYMBOL} no disponible.")
         m = markets[CCXT_SYMBOL]
@@ -178,14 +196,14 @@ class EMABot:
         return round(round(price / self.tick_size) * self.tick_size, 6)
 
     async def _equity(self) -> float:
-        bal = await self._call(self.exchange.fetch_balance())
+        bal = await self._call(lambda: self.exchange.fetch_balance())
         return float(bal.get("total", {}).get("USDT", 0))
 
     # ── Posición real en el exchange ──────────────────────────────────
 
     async def _get_position(self) -> Optional[dict]:
         """Retorna la posición abierta en el exchange o None."""
-        positions = await self._call(self.exchange.fetch_positions([CCXT_SYMBOL]))
+        positions = await self._call(lambda: self.exchange.fetch_positions([CCXT_SYMBOL]))
         for p in positions:
             if abs(float(p.get("contracts", 0))) > 0:
                 return p
@@ -231,7 +249,7 @@ class EMABot:
         pnl = 0.0
         try:
             trades = await self._call(
-                self.exchange.fetch_my_trades(CCXT_SYMBOL, limit=10)
+                lambda: self.exchange.fetch_my_trades(CCXT_SYMBOL, limit=10)
             )
             # Sumar el PnL realizado de los últimos fills (cierre de posición)
             pnl = sum(float(t.get("info", {}).get("realizedPnl", 0)) for t in trades[-4:])
@@ -272,7 +290,7 @@ class EMABot:
         """
         # 1. Cancelar órdenes pendientes primero para evitar conflictos
         try:
-            await self._call(self.exchange.cancel_all_orders(CCXT_SYMBOL))
+            await self._call(lambda: self.exchange.cancel_all_orders(CCXT_SYMBOL))
             log.info("Órdenes pendientes canceladas.")
         except Exception as e:
             log.warning(f"cancel_all: {e}")
@@ -308,7 +326,7 @@ class EMABot:
         for attempt in range(1, CLOSE_VERIFY_RETRIES + 1):
             try:
                 await self._call(
-                    self.exchange.create_order(
+                    lambda: self.exchange.create_order(
                         CCXT_SYMBOL,
                         "market",
                         close_side,
@@ -366,7 +384,7 @@ class EMABot:
 
         try:
             await self._call(
-                self.exchange.create_order(
+                lambda: self.exchange.create_order(
                     CCXT_SYMBOL,
                     "market",
                     exchange_side,
@@ -393,7 +411,7 @@ class EMABot:
     async def candles(self) -> pd.DataFrame:
         """Descarga velas, excluye la activa y calcula EMAs."""
         raw = await self._call(
-            self.exchange.fetch_ohlcv(CCXT_SYMBOL, TIMEFRAME, limit=CANDLE_LIMIT)
+            lambda: self.exchange.fetch_ohlcv(CCXT_SYMBOL, TIMEFRAME, limit=CANDLE_LIMIT)
         )
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
@@ -448,13 +466,13 @@ class EMABot:
 
         # Configurar modo one-way y apalancamiento
         try:
-            await self._call(self.exchange.set_position_mode(False))
+            await self._call(lambda: self.exchange.set_position_mode(False))
             log.info("One-Way Mode configurado.")
         except Exception as e:
             log.warning(f"set_position_mode: {e} (puede ya estar configurado)")
 
         try:
-            await self._call(self.exchange.set_leverage(LEVERAGE, CCXT_SYMBOL))
+            await self._call(lambda: self.exchange.set_leverage(LEVERAGE, CCXT_SYMBOL))
             log.info(f"Apalancamiento x{LEVERAGE} configurado.")
         except Exception as e:
             log.warning(f"set_leverage: {e}")
