@@ -203,21 +203,58 @@ class EMABot:
             self.current_side = None
             self.current_qty  = 0.0
         else:
-            contracts = float(pos["contracts"])
-            if contracts > 0:
-                new_side = "long"
-                new_qty  = contracts
-            elif contracts < 0:
+            contracts = float(pos.get("contracts", 0))
+            # En Binance one-way mode, contracts es SIEMPRE positivo.
+            # Usar el campo "side" para saber la dirección real.
+            pos_side = pos.get("side", "")   # "long" o "short" según ccxt
+
+            if abs(contracts) < self.min_qty:
+                new_side = None
+                new_qty  = 0.0
+            elif pos_side == "short":
                 new_side = "short"
                 new_qty  = abs(contracts)
             else:
-                new_side = None
-                new_qty  = 0.0
+                # "long" o cualquier valor desconocido → tratar como long
+                new_side = "long"
+                new_qty  = abs(contracts)
 
             if new_side != self.current_side:
-                log.info(f"Sincronización: estado actualizado a {new_side} ({new_qty} oz)")
+                log.info(f"Sincronización: estado actualizado a {new_side} ({new_qty} oz) [side={pos_side}]")
             self.current_side = new_side
             self.current_qty  = new_qty
+
+    # ── Notificación de cierre ────────────────────────────────────────
+
+    async def _notify_close(self, closed_side: str, qty: float):
+        """Obtiene el PnL realizado del último trade y notifica por Telegram."""
+        pnl = 0.0
+        try:
+            trades = await self._call(
+                self.exchange.fetch_my_trades(CCXT_SYMBOL, limit=10)
+            )
+            # Sumar el PnL realizado de los últimos fills (cierre de posición)
+            pnl = sum(float(t.get("info", {}).get("realizedPnl", 0)) for t in trades[-4:])
+        except Exception as e:
+            log.warning(f"No se pudo obtener PnL: {e}")
+
+        equity = 0.0
+        try:
+            equity = await self._equity()
+        except Exception as e:
+            log.warning(f"No se pudo obtener equity: {e}")
+
+        icon_side  = "🟢" if closed_side == "long" else "🔴"
+        icon_pnl   = "✅" if pnl >= 0 else "❌"
+        label_side = "LONG" if closed_side == "long" else "SHORT"
+        pnl_str    = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+
+        log.info(f"Cierre {label_side} | PnL: {pnl_str} | Equity: ${equity:.2f}")
+        tg(
+            f"{icon_side} <b>{label_side} CERRADO</b>\n"
+            f"{icon_pnl} Resultado: <b>{pnl_str}</b>\n"
+            f"💰 Capital actual: <b>${equity:.2f}</b>"
+        )
 
     # ── Cierre de posición (crítico — verificado) ─────────────────────
 
@@ -248,18 +285,24 @@ class EMABot:
             self.current_qty  = 0.0
             return True
 
-        contracts = float(pos["contracts"])
+        contracts = float(pos.get("contracts", 0))
+        pos_side  = pos.get("side", "")   # "long" o "short" en ccxt / Binance
+
         if abs(contracts) < self.min_qty:
             log.info("Posición despreciable, considerada cerrada.")
             self.current_side = None
             self.current_qty  = 0.0
             return True
 
-        # La dirección de la orden de cierre es opuesta a la posición
-        close_side = "sell" if contracts > 0 else "buy"
-        qty_to_close = abs(contracts)
+        # En Binance one-way mode contracts es siempre positivo.
+        # Usar "side" para determinar la dirección correcta del cierre.
+        if pos_side == "short":
+            close_side = "buy"    # Cerrar short → comprar
+        else:
+            close_side = "sell"   # Cerrar long  → vender
 
-        log.info(f"Cerrando posición: {close_side.upper()} {qty_to_close} oz @ mercado (reduceOnly)")
+        qty_to_close = abs(contracts)
+        log.info(f"Cerrando posición: {pos_side.upper()} {qty_to_close} oz → {close_side.upper()} @ mercado (reduceOnly)")
 
         # 3 + 4. Enviar y verificar hasta CLOSE_VERIFY_RETRIES intentos
         for attempt in range(1, CLOSE_VERIFY_RETRIES + 1):
@@ -288,6 +331,7 @@ class EMABot:
                 log.info("Posición cerrada y verificada correctamente.")
                 self.current_side = None
                 self.current_qty  = 0.0
+                await self._notify_close(pos_side, qty_to_close)
                 return True
 
             remaining = abs(float(pos_after.get("contracts", 0)))
