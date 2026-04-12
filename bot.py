@@ -138,6 +138,33 @@ class EMABot:
 
     # ── Capa de red con exponential backoff ───────────────────────────
 
+    def _ban_wait(self, error_msg: str) -> float:
+        """
+        Si el mensaje contiene un timestamp de ban de Binance,
+        retorna los segundos a esperar. Si el ban supera 1 hora,
+        notifica por Telegram y duerme en bloques de 5 min.
+        Retorna 0 si no es un mensaje de ban.
+        """
+        import re, time
+        if "banned" not in error_msg.lower() and "418" not in error_msg:
+            return 0
+        match = re.search(r'"msg".*?until\s+(\d+)', error_msg)
+        if not match:
+            log.warning("IP baneada por Binance (sin timestamp). Esperando 60s.")
+            return 60
+        ban_until_ms = int(match.group(1))
+        remaining = (ban_until_ms / 1000) - time.time()
+        if remaining <= 0:
+            return 1  # Ban ya expiró, reintentar enseguida
+        mins = remaining / 60
+        log.warning(f"IP baneada por Binance — ban expira en {mins:.1f} minutos.")
+        tg(
+            f"🚫 <b>IP baneada por Binance</b>\n"
+            f"⏳ Ban expira en: <b>{mins:.0f} minutos</b>\n"
+            f"💡 Solución: cambia la región del servidor en Render."
+        )
+        return min(remaining, 300)  # Dormir máximo 5 min por bloque
+
     async def _call(self, fn, retries: int = MAX_RETRIES):
         """
         Llama a fn() con reintentos y backoff exponencial.
@@ -148,26 +175,17 @@ class EMABot:
             try:
                 return await fn()
             except ccxt.RateLimitExceeded as e:
-                msg = str(e)
-                # Ban de IP de Binance — esperar hasta que se levante
-                if "banned" in msg.lower() or "418" in msg:
-                    wait = 60
-                    log.warning(f"IP baneada por Binance — esperando {wait}s antes de reintentar")
-                    tg(f"⚠️ IP baneada por Binance. Esperando {wait}s...")
-                else:
-                    wait = RETRY_BASE * (2 ** attempt)
-                    log.warning(f"Rate limit — esperando {wait:.0f}s")
+                wait = self._ban_wait(str(e)) or RETRY_BASE * (2 ** attempt)
+                log.warning(f"Rate limit — esperando {wait:.0f}s")
                 await asyncio.sleep(wait)
             except ccxt.NetworkError as e:
-                msg = str(e)
-                if "banned" in msg.lower() or "418" in msg:
-                    wait = 60
-                    log.warning(f"IP baneada por Binance — esperando {wait}s")
-                    tg(f"⚠️ IP baneada por Binance. Esperando {wait}s...")
+                wait = self._ban_wait(str(e))
+                if wait:
+                    await asyncio.sleep(wait)
                 else:
                     wait = RETRY_BASE * (2 ** attempt)
                     log.warning(f"Red: {e} — reintento {attempt+1}/{retries} en {wait:.0f}s")
-                await asyncio.sleep(wait)
+                    await asyncio.sleep(wait)
             except ccxt.ExchangeError as e:
                 log.error(f"Exchange: {e}")
                 raise
