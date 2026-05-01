@@ -1,15 +1,19 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   XAUUSDT EMA CROSSOVER BOT  ·  v3.0                                ║
-║   Estrategia : EMA 6 / EMA 8 Crossover  ·  Marco: M15              ║
+║   XAUUSDT EMA CROSSOVER BOT  ·  v3.1                                ║
+║   Estrategia : EMA 7 / EMA 14 Crossover  ·  Marco: M15             ║
 ║   Exchange   : Binance Futures USDT-M  ·  One-Way Mode              ║
 ║   Lógica     : Siempre en mercado — Long o Short según cruce        ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
   GATILLOS:
-    EMA6 cruza SOBRE EMA8  → cerrar SHORT (si existe) + abrir LONG
-    EMA6 cruza BAJO  EMA8  → cerrar LONG  (si existe) + abrir SHORT
+    EMA7 cruza SOBRE EMA14  → cerrar SHORT (si existe) + abrir LONG
+    EMA7 cruza BAJO  EMA14  → cerrar LONG  (si existe) + abrir SHORT
   El ciclo se repite indefinidamente sin filtros de tendencia macro.
+
+  BAN DE IP:
+    Si PROXY_LIST está configurado, el bot rota de proxy automáticamente.
+    Sin proxies, espera el tiempo del ban y continúa solo.
 """
 
 # ══════════════════════════════════════════════════════════════════════
@@ -44,8 +48,12 @@ TIMEFRAME   = "15m"
 LEVERAGE    = 10
 
 # ── Estrategia EMA ────────────────────────────────────────────────────
-EMA_FAST = 6    # EMA rápida
-EMA_SLOW = 8    # EMA lenta
+EMA_FAST = 7    # EMA rápida
+EMA_SLOW = 14   # EMA lenta
+
+# ── Proxies (opcional — rotación automática si Binance banea la IP) ───
+# En .env:  PROXY_LIST=http://user:pass@host1:port,http://user:pass@host2:port
+PROXY_LIST_RAW = os.getenv("PROXY_LIST", "")
 
 # ── Tamaño de posición ────────────────────────────────────────────────
 # Porcentaje del equity que se usa como margen por operación.
@@ -54,7 +62,7 @@ EMA_SLOW = 8    # EMA lenta
 MARGIN_PCT = 0.10   # 10% del equity como margen
 
 # ── Infraestructura ───────────────────────────────────────────────────
-CANDLE_LIMIT = 60       # Velas a descargar (más que suficiente para EMA6/8)
+CANDLE_LIMIT = 60       # Velas a descargar (más que suficiente para EMA7/14)
 LOOP_SEC     = 10       # Segundos entre ciclos del loop principal
 MAX_RETRIES  = 5        # Reintentos para llamadas API
 RETRY_BASE   = 2.0      # Base del exponential backoff (segundos)
@@ -107,22 +115,20 @@ class EMABot:
     Bot de cruce de EMAs para XAUUSDT Perpetual Futures en Binance.
 
     Siempre mantiene una posición activa (Long o Short) según el cruce
-    de EMA6 sobre EMA8. Cuando ocurre un cruce:
+    de EMA7 sobre EMA14. Cuando ocurre un cruce:
       1. Cancela todas las órdenes pendientes.
       2. Cierra la posición actual con orden de mercado (verificado).
       3. Abre inmediatamente la posición contraria con orden de mercado.
     """
 
     def __init__(self):
-        self.exchange = ccxt.binance({
-            "apiKey":    API_KEY,
-            "secret":    API_SECRET,
-            "enableRateLimit": True,
-            "options": {
-                "defaultType":             "future",
-                "adjustForTimeDifference": True,
-            },
-        })
+        # Lista de proxies para rotación automática ante bans de IP
+        self._proxy_list: list[str] = [
+            p.strip() for p in PROXY_LIST_RAW.split(",") if p.strip()
+        ]
+        self._proxy_idx: int = 0
+
+        self._init_exchange(self._proxy_list[0] if self._proxy_list else None)
 
         # Estado interno — siempre sincronizado con el exchange antes de operar
         self.current_side: Optional[str] = None   # "long", "short" o None
@@ -136,34 +142,87 @@ class EMABot:
         # Timestamp de la última vela procesada (evita doble señal)
         self._last_candle_ts = None
 
-    # ── Capa de red con exponential backoff ───────────────────────────
+    def _init_exchange(self, proxy: Optional[str] = None):
+        """Crea (o recrea) la instancia del exchange, opcionalmente con proxy."""
+        config: dict = {
+            "apiKey":          API_KEY,
+            "secret":          API_SECRET,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType":             "future",
+                "adjustForTimeDifference": True,
+            },
+        }
+        if proxy:
+            config["aiohttp_proxy"] = proxy
+        self.exchange = ccxt.binance(config)
 
-    def _ban_wait(self, error_msg: str) -> float:
-        """
-        Si el mensaje contiene un timestamp de ban de Binance,
-        retorna los segundos a esperar. Si el ban supera 1 hora,
-        notifica por Telegram y duerme en bloques de 5 min.
-        Retorna 0 si no es un mensaje de ban.
-        """
+    # ── Capa de red con exponential backoff y rotación de proxy ──────
+
+    def _is_ban_error(self, error_msg: str) -> bool:
+        return "banned" in error_msg.lower() or "418" in error_msg
+
+    def _ban_remaining(self, error_msg: str) -> float:
+        """Segundos restantes del ban según el timestamp de Binance, o 60 si no hay."""
         import re, time
-        if "banned" not in error_msg.lower() and "418" not in error_msg:
-            return 0
         match = re.search(r'"msg".*?until\s+(\d+)', error_msg)
         if not match:
-            log.warning("IP baneada por Binance (sin timestamp). Esperando 60s.")
-            return 60
-        ban_until_ms = int(match.group(1))
-        remaining = (ban_until_ms / 1000) - time.time()
-        if remaining <= 0:
-            return 1  # Ban ya expiró, reintentar enseguida
+            return 60.0
+        remaining = (int(match.group(1)) / 1000) - time.time()
+        return max(remaining, 1.0)
+
+    async def _rotate_proxy(self) -> bool:
+        """
+        Rota al siguiente proxy disponible y recrea el exchange.
+        Retorna True si la rotación fue exitosa, False si no hay proxies.
+        """
+        if not self._proxy_list:
+            return False
+
+        old_exchange = self.exchange
+        self._proxy_idx = (self._proxy_idx + 1) % len(self._proxy_list)
+        proxy = self._proxy_list[self._proxy_idx]
+
+        log.warning(f"Rotando proxy → {proxy} ({self._proxy_idx + 1}/{len(self._proxy_list)})")
+        self._init_exchange(proxy)
+
+        try:
+            await old_exchange.close()
+        except Exception:
+            pass
+
+        tg(
+            f"🔄 <b>Proxy rotado automáticamente</b>\n"
+            f"🌐 Proxy {self._proxy_idx + 1}/{len(self._proxy_list)} activo\n"
+            f"🤖 Continuando sin intervención manual..."
+        )
+        return True
+
+    async def _handle_ban(self, error_msg: str) -> float:
+        """
+        Maneja un ban de IP de Binance.
+        - Si hay proxies: rota y retorna 5s para reintentar rápido.
+        - Si no hay proxies: espera el tiempo del ban automáticamente.
+        Retorna 0 si el error no es un ban.
+        """
+        if not self._is_ban_error(error_msg):
+            return 0.0
+
+        remaining = self._ban_remaining(error_msg)
         mins = remaining / 60
         log.warning(f"IP baneada por Binance — ban expira en {mins:.1f} minutos.")
+
+        rotated = await self._rotate_proxy()
+        if rotated:
+            return 5.0  # Reintentar rápido con el proxy nuevo
+
+        # Sin proxies: esperar automáticamente en bloques de 5 min
         tg(
             f"🚫 <b>IP baneada por Binance</b>\n"
             f"⏳ Ban expira en: <b>{mins:.0f} minutos</b>\n"
-            f"💡 Solución: cambia la región del servidor en Render."
+            f"⏸️ Esperando automáticamente — no se requiere intervención."
         )
-        return min(remaining, 300)  # Dormir máximo 5 min por bloque
+        return min(remaining, 300.0)
 
     async def _call(self, fn, retries: int = MAX_RETRIES):
         """
@@ -175,11 +234,11 @@ class EMABot:
             try:
                 return await fn()
             except ccxt.RateLimitExceeded as e:
-                wait = self._ban_wait(str(e)) or RETRY_BASE * (2 ** attempt)
+                wait = await self._handle_ban(str(e)) or RETRY_BASE * (2 ** attempt)
                 log.warning(f"Rate limit — esperando {wait:.0f}s")
                 await asyncio.sleep(wait)
             except ccxt.NetworkError as e:
-                wait = self._ban_wait(str(e))
+                wait = await self._handle_ban(str(e))
                 if wait:
                     await asyncio.sleep(wait)
                 else:
@@ -443,14 +502,14 @@ class EMABot:
 
     def detect_crossover(self, df: pd.DataFrame) -> Optional[str]:
         """
-        Detecta cruce de EMA rápida (6) sobre EMA lenta (8).
+        Detecta cruce de EMA rápida (7) sobre EMA lenta (14).
 
         Usa las dos últimas velas CERRADAS para confirmar el cruce:
-          - Vela anterior: EMA6 estaba por debajo de EMA8
-          - Vela actual:   EMA6 está por encima de EMA8  → señal LONG
+          - Vela anterior: EMA7 estaba por debajo de EMA14
+          - Vela actual:   EMA7 está por encima de EMA14  → señal LONG
 
-          - Vela anterior: EMA6 estaba por encima de EMA8
-          - Vela actual:   EMA6 está por debajo de EMA8  → señal SHORT
+          - Vela anterior: EMA7 estaba por encima de EMA14
+          - Vela actual:   EMA7 está por debajo de EMA14  → señal SHORT
 
         Retorna 'long', 'short' o None (sin cruce).
         """
