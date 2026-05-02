@@ -142,6 +142,9 @@ class EMABot:
         # Timestamp de la última vela procesada (evita doble señal)
         self._last_candle_ts = None
 
+        # Equity al abrir la posición actual — usado para calcular PnL real
+        self._entry_equity: float = 0.0
+
     def _init_exchange(self, proxy: Optional[str] = None):
         """Crea (o recrea) la instancia del exchange, opcionalmente con proxy."""
         config: dict = {
@@ -322,22 +325,19 @@ class EMABot:
     # ── Notificación de cierre ────────────────────────────────────────
 
     async def _notify_close(self, closed_side: str, qty: float):
-        """Obtiene el PnL realizado del último trade y notifica por Telegram."""
-        pnl = 0.0
-        try:
-            trades = await self._call(
-                lambda: self.exchange.fetch_my_trades(CCXT_SYMBOL, limit=10)
-            )
-            # Sumar el PnL realizado de los últimos fills (cierre de posición)
-            pnl = sum(float(t.get("info", {}).get("realizedPnl", 0)) for t in trades[-4:])
-        except Exception as e:
-            log.warning(f"No se pudo obtener PnL: {e}")
-
+        """
+        Calcula el PnL real como diferencia de equity (entrada vs. cierre)
+        y notifica por Telegram. Este método es preciso porque no depende
+        de sumar fills individuales — usa directamente el equity del exchange.
+        """
         equity = 0.0
         try:
             equity = await self._equity()
         except Exception as e:
             log.warning(f"No se pudo obtener equity: {e}")
+
+        # PnL = equity al cerrar − equity al abrir (incluye fees y funding)
+        pnl = (equity - self._entry_equity) if self._entry_equity > 0 else 0.0
 
         icon_side  = "🟢" if closed_side == "long" else "🔴"
         icon_pnl   = "✅" if pnl >= 0 else "❌"
@@ -450,6 +450,7 @@ class EMABot:
         ref_price: precio de referencia para calcular la cantidad (close de la última vela)
         """
         eq = await self._equity()
+        self._entry_equity = eq   # guardar equity de entrada para PnL correcto
         notional = eq * MARGIN_PCT * LEVERAGE
         qty = self._round_qty(notional / ref_price)
 
@@ -556,10 +557,11 @@ class EMABot:
 
         # Sincronizar con el estado real del exchange al arrancar
         await self.sync_state()
-        if self.current_side:
-            log.info(f"Posición residual encontrada: {self.current_side.upper()} {self.current_qty} oz — se mantendrá.")
 
         eq = await self._equity()
+        if self.current_side:
+            self._entry_equity = eq   # referencia de entrada para posición heredada
+            log.info(f"Posición residual encontrada: {self.current_side.upper()} {self.current_qty} oz — se mantendrá.")
         tg(
             f"🟢 <b>EMA CROSSOVER BOT INICIADO</b>\n"
             f"💰 Equity: <b>${eq:.2f}</b>\n"
