@@ -45,7 +45,7 @@ TG_CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
 # ── Instrumento ───────────────────────────────────────────────────────
 CCXT_SYMBOL = "XAU/USDT:USDT"   # Binance Futures USDT-M
 TIMEFRAME   = "15m"
-LEVERAGE    = 10
+LEVERAGE    = 1
 
 # ── Estrategia EMA ────────────────────────────────────────────────────
 EMA_FAST = 7    # EMA rápida
@@ -57,9 +57,9 @@ PROXY_LIST_RAW = os.getenv("PROXY_LIST", "")
 
 # ── Tamaño de posición ────────────────────────────────────────────────
 # Porcentaje del equity que se usa como margen por operación.
-# Con LEVERAGE=10 y MARGIN_PCT=0.10 → 100% del equity como nocional.
-# Ajusta este valor según tu apetito de riesgo.
-MARGIN_PCT = 0.10   # 10% del equity como margen
+# Con LEVERAGE=1 y MARGIN_PCT=0.95 → 95% del equity como nocional (sin apalancamiento).
+# Se deja 5% de buffer para fees y variaciones de precio.
+MARGIN_PCT = 0.95   # 95% del equity — sin apalancamiento
 
 # ── Infraestructura ───────────────────────────────────────────────────
 CANDLE_LIMIT = 60       # Velas a descargar (más que suficiente para EMA7/14)
@@ -494,7 +494,7 @@ class EMABot:
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         df.set_index("ts", inplace=True)
-        df = df.astype(float).iloc[:-1]   # excluir vela incompleta (activa)
+        df = df.astype(float)              # incluir vela activa para detección en tiempo real
         df["ema_fast"] = calc_ema(df["close"], EMA_FAST)
         df["ema_slow"] = calc_ema(df["close"], EMA_SLOW)
         return df
@@ -576,24 +576,20 @@ class EMABot:
                 df = await self.candles()
                 last_ts = df.index[-1]
 
-                # Procesar solo cuando hay una nueva vela cerrada
-                if last_ts == self._last_candle_ts:
-                    await asyncio.sleep(LOOP_SEC)
-                    continue
-
-                self._last_candle_ts = last_ts
-
                 ema_fast_val = float(df["ema_fast"].iloc[-1])
                 ema_slow_val = float(df["ema_slow"].iloc[-1])
                 ref_price    = float(df["close"].iloc[-1])
 
-                log.info(
-                    f"Nueva vela: {last_ts} | "
-                    f"Precio={ref_price:.2f} | "
-                    f"EMA{EMA_FAST}={ema_fast_val:.2f} | "
-                    f"EMA{EMA_SLOW}={ema_slow_val:.2f} | "
-                    f"Posición: {self.current_side or 'ninguna'}"
-                )
+                # Log informativo solo cuando abre una nueva vela (cada 15 min)
+                if last_ts != self._last_candle_ts:
+                    self._last_candle_ts = last_ts
+                    log.info(
+                        f"Nueva vela: {last_ts} | "
+                        f"Precio={ref_price:.2f} | "
+                        f"EMA{EMA_FAST}={ema_fast_val:.2f} | "
+                        f"EMA{EMA_SLOW}={ema_slow_val:.2f} | "
+                        f"Posición: {self.current_side or 'ninguna'}"
+                    )
 
                 signal = self.detect_crossover(df)
 
